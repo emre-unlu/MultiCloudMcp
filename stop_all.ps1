@@ -1,5 +1,5 @@
 # Stop common dev processes we started
-$names = @("uvicorn", "python", "ollama")
+$names = @("uvicorn", "python", "go")
 foreach ($n in $names) {
   $ps = Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -like "*$n*" }
   foreach ($p in $ps) {
