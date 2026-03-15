@@ -80,7 +80,6 @@ class SupervisorState(TypedDict, total=False):
     operation_result: Dict[str, Any]
     execute_mitigation: bool
     diagnostics_summary: Dict[str, Any]
-    __interrupt__: List[Any]
 
 
 def _post_mcp(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -238,7 +237,6 @@ class SupervisorWorkflow:
         result = self.operations_agent.invoke({"messages": [HumanMessage(content=request)]}, config=config)
         update: SupervisorState = {"operation_result": result}
         if result.get("__interrupt__"):
-            update["__interrupt__"] = result["__interrupt__"]
             update["final_response"] = "Approval required before executing operations action."
             return update
         update["final_response"] = _extract_answer(result)
@@ -323,8 +321,6 @@ class SupervisorWorkflow:
         )
         op_state: SupervisorState = {"user_request": mitigation_request}
         result = self.operations_node(op_state, config=config)
-        if result.get("__interrupt__"):
-            return result
         final = f"{state.get('final_response', '')}\n\nMitigation execution result:\n{result.get('final_response', '')}"
         return {"final_response": final, "operation_result": result.get("operation_result", {})}
 
