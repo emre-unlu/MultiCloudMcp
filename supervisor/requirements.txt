@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+pydantic>=2
+python-dotenv
+requests
+langchain
+langchain-core
+langchain-community
+langchain-ollama

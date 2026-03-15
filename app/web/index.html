@@ -1,0 +1,423 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MCP K8s Supervisor - Chat</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-950 text-slate-100">
+  <div class="flex min-h-screen flex-col">
+    <header class="border-b border-slate-800 bg-slate-950">
+      <div class="mx-auto flex w-full max-w-6xl items-center justify-between px-6 py-5">
+        <div>
+          <h1 class="text-lg font-semibold tracking-tight">Kubernetes Supervisor</h1>
+        </div>
+        <div class="hidden items-center gap-2 sm:flex">
+          <button id="btnNewChat" class="rounded-full border border-slate-700 px-4 py-2 text-sm font-medium text-slate-200 transition hover:border-indigo-500 hover:text-white">New chat</button>
+          <button id="btnHealth" class="rounded-full border border-slate-700 px-4 py-2 text-sm font-medium text-slate-200 transition hover:border-indigo-500 hover:text-white">Check health</button>
+        </div>
+      </div>
+    </header>
+
+    <main class="flex flex-1 justify-center">
+      <div class="flex w-full max-w-6xl flex-1 flex-col gap-5 px-6 py-6">
+        <section class="grid gap-3 rounded-3xl border border-slate-800 bg-slate-900/60 p-4 shadow-lg shadow-slate-900/40 backdrop-blur">
+          <div class="grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
+            <label class="flex flex-col text-xs font-semibold uppercase tracking-wide text-slate-400">
+              Namespace
+              <input id="ns" type="text" placeholder="default or demo"
+                class="mt-2 w-full rounded-xl border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-white shadow-inner focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/40" />
+            </label>
+            <div class="flex flex-wrap gap-2 sm:justify-end">
+              <button id="btnNsDefault" class="rounded-full border border-slate-700 px-3 py-2 text-xs font-medium text-slate-200 transition hover:border-indigo-500 hover:text-white">Use default</button>
+              <button id="btnNsDemo" class="rounded-full border border-slate-700 px-3 py-2 text-xs font-medium text-slate-200 transition hover:border-indigo-500 hover:text-white">Use kube-system</button>
+              <button id="btnNewChatMobile" class="rounded-full border border-slate-700 px-3 py-2 text-xs font-medium text-slate-200 transition hover:border-indigo-500 hover:text-white sm:hidden">New chat</button>
+              <button id="btnHealthMobile" class="rounded-full border border-slate-700 px-3 py-2 text-xs font-medium text-slate-200 transition hover:border-indigo-500 hover:text-white sm:hidden">Check health</button>
+            </div>
+          </div>
+          <div class="flex flex-wrap items-center gap-2 pt-2 text-xs text-slate-400">
+            <span class="uppercase tracking-wide">Quick prompts:</span>
+            <button data-prompt="List Kubernetes namespaces" class="quickPrompt rounded-full border border-slate-700 px-3 py-1.5 text-xs font-medium text-slate-200 transition hover:border-indigo-500 hover:bg-indigo-500/10 hover:text-white">List namespaces</button>
+            <button data-prompt="List pods name" class="quickPrompt rounded-full border border-slate-700 px-3 py-1.5 text-xs font-medium text-slate-200 transition hover:border-indigo-500 hover:bg-indigo-500/10 hover:text-white">List Pods</button>
+            <button data-prompt="Show pods with status errors" class="quickPrompt rounded-full border border-slate-700 px-3 py-1.5 text-xs font-medium text-slate-200 transition hover:border-indigo-500 hover:bg-indigo-500/10 hover:text-white">Pods with errors</button>
+          </div>
+        </section>
+
+        <section class="flex-1 overflow-hidden rounded-3xl border border-slate-800 bg-slate-900/80 shadow-xl shadow-slate-900/40">
+          <div id="messages" class="flex h-full flex-col gap-4 overflow-y-auto p-6">
+            <!-- messages render here -->
+          </div>
+        </section>
+
+        <section class="rounded-3xl border border-slate-800 bg-slate-900/80 p-4 shadow-xl shadow-slate-900/40">
+          <div class="flex flex-col gap-3">
+            <div class="flex items-center gap-3 text-xs text-slate-400">
+              <label class="flex items-center gap-2">
+                <input id="showRaw" type="checkbox" class="h-4 w-4 rounded border-slate-700 bg-slate-900 text-indigo-500 focus:ring-indigo-500" />
+                Show raw JSON
+              </label>
+              <span>Press <kbd class="rounded border border-slate-700 px-1">Ctrl</kbd>+<kbd class="rounded border border-slate-700 px-1">Enter</kbd> to send</span>
+            </div>
+            <div class="flex items-end gap-3">
+              <textarea id="goal" rows="1" placeholder="Send a message to your Kubernetes Supervisor..."
+                class="min-h-[56px] flex-1 resize-none rounded-2xl border border-slate-700 bg-slate-950/60 px-4 py-3 text-sm text-slate-100 shadow-inner focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/40"></textarea>
+              <button id="send" class="rounded-full bg-indigo-500 px-6 py-3 text-sm font-medium text-white shadow-lg shadow-indigo-500/30 transition hover:bg-indigo-400 disabled:cursor-not-allowed disabled:bg-slate-700">Send</button>
+            </div>
+          </div>
+        </section>
+
+        <pre id="raw" class="hidden max-h-64 overflow-auto rounded-3xl border border-slate-800 bg-slate-950 p-4 text-xs text-slate-300"></pre>
+      </div>
+    </main>
+  </div>
+
+  <script>
+    const api = {
+      async run(goal, threadId) {
+        const res = await fetch("/api/run", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            message: goal,
+            thread_id: threadId || null
+          })
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      },
+      async health() {
+        const res = await fetch("/api/health");
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      }
+    };
+
+    const $ = (id) => document.getElementById(id);
+    const state = {
+      messages: [],
+      rawPayload: null,
+      sending: false,
+      threadId: null
+    };
+
+    function escapeHtml(value) {
+      return value.replace(/[&<>'"]/g, (c) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;"
+      }[c]));
+    }
+
+    function formatMarkdown(value) {
+      const escaped = escapeHtml(value || "");
+      const blocks = escaped.split(/```/g);
+      let html = "";
+      let inCodeBlock = false;
+
+      for (const block of blocks) {
+        if (inCodeBlock) {
+          let code = block;
+          code = code.replace(/^\w+\n/, "");
+          html += `<pre class="overflow-x-auto rounded-2xl border border-slate-800 bg-slate-900/60 p-3 text-xs text-slate-200"><code>${code}</code></pre>`;
+        } else {
+          let chunk = block;
+          chunk = chunk.replace(/`([^`]+)`/g, '<code class="rounded bg-slate-800/70 px-1 py-0.5 text-xs text-slate-200">$1</code>');
+          chunk = chunk.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+          chunk = chunk.replace(/(?:^|\n)(\s*)([*-])\s+/g, (match, indent) => `\n${" ".repeat(indent.length)}• `);
+          html += chunk.replace(/\n/g, "<br>");
+        }
+        inCodeBlock = !inCodeBlock;
+      }
+
+      return html;
+    }
+
+    function formatPlainText(value) {
+      return escapeHtml(value || "").replace(/\n/g, "<br>");
+    }
+
+    function generateId() {
+      return Math.random().toString(36).slice(2) + Date.now().toString(36);
+    }
+
+    function loadMessages() {
+      try {
+        const stored = JSON.parse(localStorage.getItem("chat_history") || "[]");
+        if (Array.isArray(stored)) {
+          state.messages = stored;
+        }
+      } catch (err) {
+        console.warn("Unable to restore chat history", err);
+        state.messages = [];
+      }
+      const storedThread = localStorage.getItem("chat_thread_id");
+      if (storedThread) {
+        state.threadId = storedThread;
+      }
+    }
+
+    function persistMessages() {
+      const trimmed = state.messages.slice(-50).map(({ raw, ...rest }) => rest);
+      localStorage.setItem("chat_history", JSON.stringify(trimmed));
+      if (state.threadId) {
+        localStorage.setItem("chat_thread_id", state.threadId);
+      }
+    }
+
+    function newThreadId() {
+      if (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") {
+        return globalThis.crypto.randomUUID();
+      }
+      return "thread-" + generateId();
+    }
+
+    function ensureThreadId() {
+      if (!state.threadId) {
+        state.threadId = localStorage.getItem("chat_thread_id") || newThreadId();
+        localStorage.setItem("chat_thread_id", state.threadId);
+      }
+      return state.threadId;
+    }
+
+    function resetConversation() {
+      state.threadId = newThreadId();
+      localStorage.setItem("chat_thread_id", state.threadId);
+      state.messages = [];
+      state.rawPayload = null;
+      persistMessages();
+      renderMessages();
+      renderRaw();
+    }
+
+    function renderRaw() {
+      const rawEl = $("raw");
+      if (!rawEl) return;
+      const shouldShow = $("showRaw").checked && state.rawPayload;
+      rawEl.classList.toggle("hidden", !shouldShow);
+      rawEl.textContent = shouldShow ? JSON.stringify(state.rawPayload, null, 2) : "";
+    }
+
+    function renderMessages() {
+      const container = $("messages");
+      container.innerHTML = "";
+
+      if (!state.messages.length) {
+        const empty = document.createElement("div");
+        empty.className = "flex flex-col items-center gap-2 rounded-3xl border border-dashed border-slate-800 bg-slate-950/40 p-8 text-center text-sm text-slate-400";
+        empty.innerHTML = `
+          <span class="text-base font-medium text-slate-200">Start a new conversation</span>
+          <span>Describe what you need and the Kubernetes Supervisor will respond here.</span>
+        `;
+        container.appendChild(empty);
+      } else {
+        state.messages.forEach((msg) => {
+          const wrapper = document.createElement("div");
+          const role = msg.role || "assistant";
+          if (role === "user") {
+            wrapper.className = "flex justify-end";
+          } else if (role === "system") {
+            wrapper.className = "flex justify-center";
+          } else {
+            wrapper.className = "flex justify-start";
+          }
+
+          const bubble = document.createElement("div");
+          const label = role === "user" ? "You" : role === "system" ? "System" : "Supervisor";
+          let bubbleClasses = "max-w-3xl rounded-3xl px-4 py-3 text-sm leading-relaxed shadow-lg shadow-slate-950/40";
+          let labelClasses = "mb-2 text-xs font-semibold uppercase tracking-wide";
+
+          if (role === "user") {
+            bubbleClasses += " bg-indigo-500 text-white ml-12";
+            labelClasses += " text-indigo-200/90";
+          } else if (role === "system") {
+            bubbleClasses += " border border-slate-800 bg-slate-950/80 text-slate-300 text-center";
+            labelClasses += " text-slate-400";
+          } else {
+            bubbleClasses += " border border-slate-800 bg-slate-950/85 text-slate-100 mr-12";
+            labelClasses += " text-slate-400";
+          }
+
+          bubble.className = bubbleClasses;
+
+          if (!(role === "system" && msg.pending)) {
+            const labelEl = document.createElement("div");
+            labelEl.className = labelClasses;
+            labelEl.textContent = label;
+            bubble.appendChild(labelEl);
+          }
+
+          const body = document.createElement("div");
+          if (msg.pending) {
+            body.className = "flex items-center gap-2 text-slate-400";
+            body.innerHTML = `
+              <span class="h-2 w-2 animate-bounce rounded-full bg-slate-500"></span>
+              <span class="h-2 w-2 animate-bounce rounded-full bg-slate-500 [animation-delay:150ms]"></span>
+              <span class="h-2 w-2 animate-bounce rounded-full bg-slate-500 [animation-delay:300ms]"></span>
+              <span class="ml-2 text-xs uppercase tracking-wide">Thinking...</span>
+            `;
+          } else {
+            body.className = "space-y-3 whitespace-pre-wrap";
+            body.innerHTML = role === "user" ? formatPlainText(msg.content) : formatMarkdown(msg.content);
+          }
+          bubble.appendChild(body);
+
+          if (msg.ns && !msg.pending) {
+            const nsTag = document.createElement("div");
+            nsTag.className = role === "user"
+              ? "mt-3 inline-flex items-center rounded-full bg-white/20 px-3 py-1 text-xs font-medium text-white"
+              : "mt-3 inline-flex items-center rounded-full border border-slate-700 px-3 py-1 text-xs font-medium text-slate-300";
+            nsTag.textContent = `Namespace: ${msg.ns}`;
+            bubble.appendChild(nsTag);
+          }
+
+          wrapper.appendChild(bubble);
+          container.appendChild(wrapper);
+        });
+      }
+
+      requestAnimationFrame(() => {
+        container.scrollTop = container.scrollHeight;
+      });
+    }
+
+    function toggleSending(on) {
+      state.sending = on;
+      const btn = $("send");
+      btn.disabled = on;
+      btn.textContent = on ? "Sending..." : "Send";
+    }
+
+    function addMessage(role, content, extra = {}) {
+      const msg = { id: generateId(), role, content, ...extra };
+      state.messages.push(msg);
+      persistMessages();
+      renderMessages();
+      return msg;
+    }
+
+    function updateMessage(id, updates) {
+      const idx = state.messages.findIndex((m) => m.id === id);
+      if (idx === -1) return;
+      state.messages[idx] = { ...state.messages[idx], ...updates };
+      persistMessages();
+      renderMessages();
+    }
+
+    function setRawPayload(data) {
+      state.rawPayload = data;
+      renderRaw();
+    }
+
+    async function send() {
+      if (state.sending) return;
+      const textarea = $("goal");
+      const input = textarea.value.trim();
+      const ns = $("ns").value.trim();
+
+      if (!input) {
+        textarea.focus();
+        return;
+      }
+
+      const threadId = ensureThreadId();
+
+      textarea.value = "";
+      autoResize(textarea);
+
+      addMessage("user", input, ns ? { ns } : {});
+      let goal = input;
+      if (ns) {
+        goal += `\n\n(Use namespace: ${ns})`;
+      }
+
+      toggleSending(true);
+      const placeholder = addMessage("assistant", "", { pending: true });
+
+      try {
+        const data = await api.run(goal, threadId);
+        if (data.thread_id && data.thread_id !== state.threadId) {
+          state.threadId = data.thread_id;
+          localStorage.setItem("chat_thread_id", state.threadId);
+        }
+        const content = data.answer || JSON.stringify(data, null, 2);
+        updateMessage(placeholder.id, { content, pending: false, raw: data });
+        setRawPayload(data);
+      } catch (error) {
+        updateMessage(placeholder.id, { content: `Request failed: ${error.message}`, pending: false });
+      } finally {
+        toggleSending(false);
+      }
+    }
+
+    async function runHealthCheck() {
+      const pending = addMessage("system", "Checking cluster health...", { pending: true });
+      try {
+        const data = await api.health();
+        updateMessage(pending.id, { content: `Health: ${JSON.stringify(data, null, 2)}`, pending: false });
+        setRawPayload(data);
+      } catch (error) {
+        updateMessage(pending.id, { content: `Health check failed: ${error.message}`, pending: false });
+      }
+    }
+
+    function registerQuickPrompts() {
+      document.querySelectorAll(".quickPrompt").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const prompt = btn.getAttribute("data-prompt");
+          const textarea = $("goal");
+          textarea.value = prompt;
+          autoResize(textarea);
+          send();
+        });
+      });
+    }
+
+    function autoResize(el) {
+      el.style.height = "auto";
+      el.style.height = Math.min(el.scrollHeight, 220) + "px";
+    }
+
+    function wireEvents() {
+      $("send").addEventListener("click", send);
+      $("showRaw").addEventListener("change", renderRaw);
+      const textarea = $("goal");
+      textarea.addEventListener("input", () => autoResize(textarea));
+      textarea.addEventListener("keydown", (event) => {
+        if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+          event.preventDefault();
+          send();
+        }
+      });
+      [$("btnHealth"), $("btnHealthMobile")].forEach((btn) => {
+        if (btn) {
+          btn.addEventListener("click", runHealthCheck);
+        }
+      });
+      [$("btnNewChat"), $("btnNewChatMobile")].forEach((btn) => {
+        if (btn) {
+          btn.addEventListener("click", resetConversation);
+        }
+      });
+      $("btnNsDefault").addEventListener("click", () => { $("ns").value = "default"; });
+      $("btnNsDemo").addEventListener("click", () => { $("ns").value = "kube-system"; });
+    }
+
+    function init() {
+      loadMessages();
+      ensureThreadId();
+      wireEvents();
+      registerQuickPrompts();
+      renderMessages();
+      renderRaw();
+      const textarea = $("goal");
+      autoResize(textarea);
+      textarea.focus();
+    }
+
+    document.addEventListener("DOMContentLoaded", init);
+  </script>
+</body>
+</html>
