@@ -93,6 +93,17 @@ def _parse_decision(message: str, allowed: Set[str]) -> Tuple[str, str | None]:
     return ("invalid", "Please reply with 'approve' or 'reject <reason>'.")
 
 
+def _normalize_answer_content(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    try:
+        return json.dumps(content, ensure_ascii=False)
+    except TypeError:
+        return str(content)
+
+
 def _register_interrupt(thread_id: str, interrupts: List[Any]) -> Tuple[str, Set[str]]:
     requests, reviews = _flatten_interrupts(interrupts)
     allowed = _allowed_decisions(reviews)
@@ -173,17 +184,19 @@ def run(req: RunReq):
         )
         PENDING_INTERRUPTS.pop(thread_id, None)
     else:
-        result = agent.invoke({"messages": [HumanMessage(content=content)]}, config=config)
+        result = agent.invoke({"messages": [HumanMessage(content=content)], "user_request": content}, config=config)
 
-    answer = result.get("output")
+    answer = _normalize_answer_content(result.get("final_response"))
+    if not answer:
+        answer = _normalize_answer_content(result.get("output"))
     if not answer:
         messages = result.get("messages", [])
         for message in reversed(messages):
             if isinstance(message, AIMessage):
-                answer = message.content
+                answer = _normalize_answer_content(message.content)
                 break
             if isinstance(message, dict) and message.get("role") == "assistant":
-                answer = message.get("content")
+                answer = _normalize_answer_content(message.get("content"))
                 break
 
     interrupts = result.get("__interrupt__")
