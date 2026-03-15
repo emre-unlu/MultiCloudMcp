@@ -246,15 +246,41 @@ class SupervisorWorkflow:
         namespace_match = re.search(r"namespace\s+([a-z0-9-]+)", text.lower())
         namespace = namespace_match.group(1) if namespace_match else "default"
         pods = self.diagnostics_tools["list_pods"](namespace)
-        pod_items = pods.get("pods") if isinstance(pods, dict) else None
+        if isinstance(pods, list):
+            pod_items = pods
+        elif isinstance(pods, dict):
+            pod_items = pods.get("pods") if isinstance(pods.get("pods"), list) else []
+        else:
+            pod_items = []
         issue_found = False
         unhealthy: List[str] = []
-        if isinstance(pod_items, list):
-            for pod in pod_items:
-                phase = str(pod.get("phase", "")).lower()
-                if phase not in {"running", "succeeded"}:
-                    unhealthy.append(pod.get("name", "unknown"))
-            issue_found = bool(unhealthy)
+        for pod in pod_items:
+            phase = str(pod.get("phase", "")).lower()
+            reason = str(pod.get("reason", "")).lower()
+            restarts = int(pod.get("restarts") or 0)
+            containers = pod.get("containers") if isinstance(pod.get("containers"), list) else []
+            container_unhealthy = any(
+                (
+                    str(container.get("state", {}).get("state", "")).lower() in {"waiting", "terminated"}
+                    or any(
+                        token in str(container.get("state", {}).get(field, "")).lower()
+                        for field in ("reason", "message")
+                        for token in ("crashloop", "backoff", "error", "imagepull")
+                    )
+                )
+                for container in containers
+                if isinstance(container, dict)
+            )
+            pod_unhealthy = (
+                phase not in {"running", "succeeded"}
+                or any(token in reason for token in ("crashloop", "backoff", "error", "imagepull"))
+                or container_unhealthy
+                or restarts > 0
+            )
+            if pod_unhealthy:
+                unhealthy.append(str(pod.get("name", "unknown")))
+
+        issue_found = bool(unhealthy)
         summary = {
             "namespace": namespace,
             "pods_checked": len(pod_items or []),
