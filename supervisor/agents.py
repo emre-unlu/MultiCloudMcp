@@ -1,117 +1,87 @@
-
-
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import logging
 import os
-from typing import Any, Dict, Iterable, List, Optional
-from uuid import uuid4
-
-logger = logging.getLogger(__name__)
+import re
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, TypedDict
 
 import requests
 from langchain.agents import create_agent
-from langchain.tools import BaseTool, tool
-from langgraph.checkpoint.memory import InMemorySaver
 from langchain.agents.middleware import HumanInTheLoopMiddleware
 from langchain.messages import AIMessage, HumanMessage
+from langchain.tools import BaseTool, tool
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import END, START, StateGraph
 
 try:
     from langchain.tools import StructuredTool
-except ImportError:  
+except ImportError:  # pragma: no cover
     StructuredTool = None
+
 try:
-    from langchain_ollama import ChatOllama
-except ImportError:  
-    ChatOllama = None
+    from langchain_openai import ChatOpenAI
+except ImportError:  # pragma: no cover
+    ChatOpenAI = None
+
+logger = logging.getLogger(__name__)
 
 K8S_MCP_URL = os.getenv("K8S_MCP_URL", "http://127.0.0.1:8080")
 HDRS = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
 _SESSION = requests.Session()
 CHECKPOINTER = InMemorySaver()
-DIAGNOSTICS_CHECKPOINTER = InMemorySaver()
-HITL_POLICY: Dict[str, Any] = {
-    "k8s_create_deployment": True,
-    "k8s_scale_deployment": True,
-    "k8s_delete_deployment": True,
-    "k8s_delete_pod": True,
-    "k8s_list_namespaces": False,
-    "k8s_list_nodes": False,
-    "k8s_list_pods": False,
-    "k8s_pod_logs": False,
-    "k8s_pod_events": False,
-    "k8s_run_diagnostics": False,
-    "k8s_get_namespace": False,
-    "k8s_get_logs": False,
-    "k8s_get_metrics": False,
-    "k8s_get_traces": False,
-    "k8s_read_metrics": False,
-    "k8s_read_traces": False,
-    "k8s_exec_shell": False,
+
+INSPECT_INTENT_KEYWORDS = {
+    "list",
+    "show",
+    "inspect",
+    "describe",
+    "status",
+    "get",
+    "namespace",
+    "pod",
+    "deployment",
+}
+ACT_INTENT_KEYWORDS = {
+    "create",
+    "delete",
+    "scale",
+    "restart",
+    "patch",
+    "apply",
+    "rollout",
+}
+DIAGNOSE_INTENT_KEYWORDS = {
+    "diagnose",
+    "diagnostics",
+    "health",
+    "issue",
+    "problem",
+    "root cause",
+    "analyze",
+    "mitigation",
+    "failing",
+    "not working",
+    "anomaly",
 }
 
-DIAGNOSTICS_TOOL_ALLOWLIST = {
-    "k8s_list_pods",
-    "k8s_pod_events",
-    "k8s_pod_logs",
-    "k8s_get_logs",
-    "k8s_get_metrics",
-    "k8s_get_traces",
-    "k8s_read_metrics",
-    "k8s_read_traces",
-    "k8s_exec_shell",
-    
-}
-SUPERVISOR_TOOL_DENYLIST = {
-    "k8s_diagnose_cluster",
-    "k8s_pod_logs",
-    "k8s_get_logs",
-    "k8s_get_metrics",
-    "k8s_get_traces",
-    "k8s_read_metrics",
-    "k8s_read_traces",
-    "k8s_exec_shell",
 
-}
-
-DIAGNOSTICS_SYSTEM_PROMPT = """You are the Kubernetes diagnostics worker agent.
-You have access to the following tools to investigate Kubernetes clusters.
-
-== Available Tools ==
-- k8s_get_logs(namespace, service): Returns log data for pods behind a service label selector.
-- k8s_get_metrics(namespace, duration): Collects Prometheus metrics and returns a directory path
-  containing CSV files.
-- k8s_read_metrics(file_path): Reads a metrics CSV file and returns its contents as text.
-- k8s_get_traces(namespace, duration): Collects Jaeger traces and returns a directory path containing traces.csv.
-- k8s_read_traces(file_path): Reads a traces CSV file and returns its contents as text.
-
-You are also provided an API to a secure terminal to the service where you can run commands:
-
-- k8s_exec_shell(command, timeout=30): Executes a shell command in the diagnostics environment and
-  returns stdout/stderr (non-interactive, no stateful shell session).
-
-Finally you need to answer the user with:
-
-- A concise summary of your findings.
-- Recommendations for next steps to resolve the user's goal.
-- Structured JSON with the following fields:
-- Start with “What I checked” (max 4 bullets).
-- Then “Findings” with concrete evidence (key values/lines).
-- Then “Conclusion: Healthy/Not healthy/Unclear” with confidence.
-- Then “Next step” (one actionable step) only if needed.
-
-Never attempt to mutate the cluster or guess. If information is missing, say so in the
-summary and recommendations."""
-
-_DIAGNOSTICS_AGENT = None
-_DEFAULT_SIGNATURE_SECRET = "diagnostics-worker-signing-key"
+class SupervisorState(TypedDict, total=False):
+    user_request: str
+    intent: Literal["inspect", "act", "diagnose"]
+    issue_found: bool
+    location: str
+    analysis_result: str
+    mitigation_plan: Dict[str, Any]
+    final_response: str
+    operation_result: Dict[str, Any]
+    execute_mitigation: bool
+    diagnostics_summary: Dict[str, Any]
+    __interrupt__: List[Any]
 
 
 def _post_mcp(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Send a JSON-RPC request to the MCP server and return the decoded line."""
     response = _SESSION.post(url, headers=HDRS, json=payload, timeout=90, stream=True)
     response.raise_for_status()
     for line in response.iter_lines(decode_unicode=True):
@@ -121,7 +91,6 @@ def _post_mcp(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def mcp_call_tool(name: str, arguments: Dict[str, Any]) -> Any:
-    """Invoke a named MCP tool and return its structured payload."""
     resp = _post_mcp(
         K8S_MCP_URL,
         {
@@ -141,172 +110,9 @@ def mcp_call_tool(name: str, arguments: Dict[str, Any]) -> Any:
 
 
 def _call_mcp_json(tool_name: str, **arguments: Any) -> str:
-    """Convenience wrapper returning a JSON string to keep LangChain outputs uniform."""
     clean_args = {k: v for k, v in arguments.items() if v is not None}
     data = mcp_call_tool(tool_name, clean_args)
-    # Keep compact to make responses easier to read in UI.
     return json.dumps(data, indent=2, ensure_ascii=False)
-
-
-def _build_llm(model_spec: Optional[str] = None) -> Any:
-    spec = model_spec or os.getenv("MODEL", "ollama:gpt-oss:20b-cloud")
-    llm: Any = spec
-    if spec.startswith("ollama:"):
-        if ChatOllama is None:
-            raise RuntimeError(
-                "MODEL is set to an Ollama backend but langchain_ollama is not installed. "
-                "Install with `pip install langchain-ollama`."
-            )
-        _, _, remaining = spec.partition(":")
-        model_name = remaining or "ollama:gpt-oss:20b-cloud"
-        base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-        llm = ChatOllama(model=model_name, base_url=base_url)
-    return llm
-
-
-def _build_tools(allowed_names: Optional[Iterable[str]] = None) -> Iterable[BaseTool]:
-    """Construct LangChain tools that proxy to MCP endpoints."""
-    allowed = set(allowed_names) if allowed_names is not None else None
-
-    def wrap(fn, *, name: str, description: str) -> BaseTool:
-        if StructuredTool is not None:
-            return StructuredTool.from_function(fn, name=name, description=description)
-        # Fallback to classic tool decorator which returns a Tool instance.
-        decorated = tool(fn, return_direct=False)
-        decorated.name = name
-        decorated.description = description
-        return decorated
-    
-    def exec_shell(command: str, timeout: int = 30) -> str:
-        """Execute a shell command in the diagnostics environment."""
-        return _call_mcp_json("exec_shell", command=command, timeout=timeout)
-
-
-    def list_nodes() -> str:
-        """List Kubernetes nodes and readiness state."""
-        return _call_mcp_json("list_nodes")
-
-    def list_namespaces() -> str:
-        """List Kubernetes namespaces."""
-        return _call_mcp_json("list_namespaces")
-
-    def list_pods(namespace: str) -> str:
-        """List pods in a namespace with phase/ready/restart details."""
-        return _call_mcp_json("list_pods", namespace=namespace)
-
-    def pod_events(namespace: str, pod: str) -> str:
-        """List recent events for a pod."""
-        return _call_mcp_json("pod_events", namespace=namespace, pod=pod)
-
-    def pod_logs(namespace: str, pod: str, tail_lines: int = 80) -> str:
-        """Get recent pod logs."""
-        return _call_mcp_json("pod_logs", namespace=namespace, pod=pod, tail_lines=tail_lines)
-
-    def get_logs(namespace: str, service: str) -> str:
-        """Collect service logs for pods selected by the service."""
-        return _call_mcp_json("get_logs", namespace=namespace, service=service)
-
-    def get_metrics(namespace: str, duration: int = 5) -> str:
-        """Collect Prometheus metrics and return the output directory."""
-        return _call_mcp_json("get_metrics", namespace=namespace, duration=duration)
-
-    def get_traces(namespace: str, duration: int = 5) -> str:
-        """Collect Jaeger traces and return the output directory."""
-        return _call_mcp_json("get_traces", namespace=namespace, duration=duration)
-
-    def read_metrics(file_path: str) -> str:
-        """Read metrics from a CSV file path."""
-        return _call_mcp_json("read_metrics", file_path=file_path)
-
-    def read_traces(file_path: str) -> str:
-        """Read traces from a CSV file path."""
-        return _call_mcp_json("read_traces", file_path=file_path)
-
-    def create_deployment(namespace: str, name: str, image: str = "nginx", replicas: int = 1) -> str:
-        """Create a small deployment."""
-        return _call_mcp_json(
-            "create_deployment",
-            namespace=namespace,
-            name=name,
-            image=image,
-            replicas=replicas,
-        )
-
-    def scale_deployment(namespace: str, name: str, replicas: int) -> str:
-        """Scale an existing deployment."""
-        return _call_mcp_json(
-            "scale_deployment",
-            namespace=namespace,
-            name=name,
-            replicas=replicas,
-        )
-
-    def delete_deployment(namespace: str, name: str, grace_period_seconds: Optional[int] = None) -> str:
-        """Delete a deployment after confirming namespace/name."""
-        return _call_mcp_json(
-            "delete_deployment",
-            namespace=namespace,
-            name=name,
-            grace_period_seconds=grace_period_seconds,
-        )
-
-    def delete_pod(namespace: str, name: str, grace_period_seconds: Optional[int] = None) -> str:
-        """Delete a pod and scale the owning deployment down when applicable."""
-        return _call_mcp_json(
-            "delete_pod",
-            namespace=namespace,
-            name=name,
-            grace_period_seconds=grace_period_seconds,
-        )
-    
-
-    def run_diagnostics(
-        goal: str,
-        namespace: Optional[str] = None,
-        workload: Optional[str] = None,
-        include_logs: bool = True,
-        max_pods: int = 3,
-    ) -> str:
-        """Delegate to the diagnostics worker for a scoped investigation."""
-        return _run_diagnostics_worker(
-            goal=goal,
-            namespace=namespace,
-            workload=workload,
-            include_logs=include_logs,
-            max_pods=max_pods,
-        )
-
-    tool_specs = [
-        ("k8s_exec_shell", exec_shell, exec_shell.__doc__ or ""),
-        ("k8s_list_nodes", list_nodes, list_nodes.__doc__ or ""),
-        ("k8s_list_namespaces", list_namespaces, list_namespaces.__doc__ or ""),
-        ("k8s_list_pods", list_pods, list_pods.__doc__ or ""),
-        ("k8s_pod_events", pod_events, pod_events.__doc__ or ""),
-        ("k8s_pod_logs", pod_logs, pod_logs.__doc__ or ""),
-        ("k8s_get_logs", get_logs, get_logs.__doc__ or ""),
-        ("k8s_get_metrics", get_metrics, get_metrics.__doc__ or ""),
-        ("k8s_get_traces", get_traces, get_traces.__doc__ or ""),
-        ("k8s_read_metrics", read_metrics, read_metrics.__doc__ or ""),
-        ("k8s_read_traces", read_traces, read_traces.__doc__ or ""),
-        ("k8s_create_deployment", create_deployment, create_deployment.__doc__ or ""),
-        ("k8s_scale_deployment", scale_deployment, scale_deployment.__doc__ or ""),
-        ("k8s_delete_deployment", delete_deployment, delete_deployment.__doc__ or ""),
-        ("k8s_delete_pod", delete_pod, delete_pod.__doc__ or ""),
-        ("k8s_run_diagnostics", run_diagnostics, run_diagnostics.__doc__ or ""),
-    ]
-
-    tools: List[BaseTool] = []
-    for name, fn, description in tool_specs:
-       
-        if allowed is not None and name not in allowed:
-            continue
-
-        
-        if allowed is None and name in SUPERVISOR_TOOL_DENYLIST:
-            continue
-
-        tools.append(wrap(fn, name=name, description=description))
-    return tools
 
 
 def _extract_answer(payload: Dict[str, Any]) -> str:
@@ -316,98 +122,285 @@ def _extract_answer(payload: Dict[str, Any]) -> str:
     messages = payload.get("messages", [])
     for message in reversed(messages):
         if isinstance(message, AIMessage):
-            content = message.content
-            if isinstance(content, str):
-                return content
-            if isinstance(content, list):
-                parts = [
-                    chunk.get("text")
-                    for chunk in content
-                    if isinstance(chunk, dict) and chunk.get("type") == "text"
-                ]
-                if parts:
-                    return "\n".join(filter(None, parts))
+            return message.content if isinstance(message.content, str) else str(message.content)
         if isinstance(message, dict) and message.get("role") == "assistant":
-            assistant_content = message.get("content")
-            if isinstance(assistant_content, str):
-                return assistant_content
-    raise RuntimeError("Diagnostics worker returned no output.")
+            return str(message.get("content", ""))
+    return ""
 
 
-def _get_diagnostics_agent():
-    global _DIAGNOSTICS_AGENT
-    if _DIAGNOSTICS_AGENT is None:
-        diag_model = os.getenv("DIAGNOSTICS_MODEL", "ollama:gpt-oss:20b-cloud")
-        tools = list(_build_tools(allowed_names=DIAGNOSTICS_TOOL_ALLOWLIST))
-        _DIAGNOSTICS_AGENT = create_agent(
-            model=_build_llm(diag_model),
-            tools=tools,
-            system_prompt=DIAGNOSTICS_SYSTEM_PROMPT,
-            checkpointer=DIAGNOSTICS_CHECKPOINTER,
-        )
-    return _DIAGNOSTICS_AGENT
+def _build_llm(model_spec: Optional[str] = None) -> Any:
+    model_name = model_spec or os.getenv("MODEL", "gpt-5-mini-2025-08-07")
+    if ChatOpenAI is None:
+        raise RuntimeError("Install langchain-openai to use OpenAI models.")
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set. Please export it before starting the supervisor.")
+    return ChatOpenAI(model=model_name, api_key=api_key)
 
 
-def _run_diagnostics_worker(
-    goal: str,
-    namespace: Optional[str],
-    workload: Optional[str],
-    include_logs: bool,
-    max_pods: int,
-) -> str:
-    clean_goal = (goal or "").strip()
-    if not clean_goal:
-        raise ValueError("goal is required for diagnostics")
-    if max_pods <= 0:
-        raise ValueError("max_pods must be a positive integer")
+def classify_intent(user_request: str) -> Literal["inspect", "act", "diagnose"]:
+    text = (user_request or "").lower()
+    if any(keyword in text for keyword in DIAGNOSE_INTENT_KEYWORDS):
+        return "diagnose"
+    if any(keyword in text for keyword in ACT_INTENT_KEYWORDS):
+        return "act"
+    if any(keyword in text for keyword in INSPECT_INTENT_KEYWORDS):
+        return "inspect"
+    return "inspect"
 
-    worker = _get_diagnostics_agent()
-    focus_namespace = namespace.strip() if namespace else "all namespaces"
-    focus_workload = workload.strip() if workload else "any workload"
-    lines = [
-        f"Goal: {clean_goal}",
-        f"Namespace focus: {focus_namespace}",
-        f"Workload focus: {focus_workload}",
-        f"Collect logs: {'yes' if include_logs else 'no'}",
-        f"Max pods for deep inspection: {max_pods}",
-        "Follow the diagnostics workflow and return the summary plus structured JSON.",
+
+def _build_operations_tools() -> Iterable[BaseTool]:
+    def wrap(fn, *, name: str, description: str) -> BaseTool:
+        if StructuredTool is not None:
+            return StructuredTool.from_function(fn, name=name, description=description)
+        decorated = tool(fn, return_direct=False)
+        decorated.name = name
+        decorated.description = description
+        return decorated
+
+    def list_namespaces() -> str:
+        """List Kubernetes namespaces."""
+        return _call_mcp_json("list_namespaces")
+
+    def list_pods(namespace: str = "default") -> str:
+        """List pods for a namespace."""
+        return _call_mcp_json("list_pods", namespace=namespace)
+
+    def describe_resource(kind: str, name: str, namespace: str = "default") -> str:
+        """Describe a Kubernetes resource."""
+        command = f"kubectl describe {kind} {name} -n {namespace}"
+        return _call_mcp_json("exec_shell", command=command, timeout=30)
+
+    def create_pod(namespace: str, name: str, image: str) -> str:
+        """Create a pod from an image."""
+        command = f"kubectl run {name} --image={image} -n {namespace}"
+        return _call_mcp_json("exec_shell", command=command, timeout=30)
+
+    def delete_pod(namespace: str, name: str, grace_period_seconds: Optional[int] = None) -> str:
+        """Delete a pod by name."""
+        return _call_mcp_json("delete_pod", namespace=namespace, name=name, grace_period_seconds=grace_period_seconds)
+
+    def scale_deployment(namespace: str, name: str, replicas: int) -> str:
+        """Scale a deployment to desired replicas."""
+        return _call_mcp_json("scale_deployment", namespace=namespace, name=name, replicas=replicas)
+
+    def restart_rollout(namespace: str, name: str) -> str:
+        """Restart deployment rollout."""
+        command = f"kubectl rollout restart deployment/{name} -n {namespace}"
+        return _call_mcp_json("exec_shell", command=command, timeout=30)
+
+    def patch_resource(kind: str, name: str, patch: str, namespace: str = "default") -> str:
+        """Patch a Kubernetes resource with JSON patch string."""
+        command = f"kubectl patch {kind} {name} -n {namespace} -p '{patch}'"
+        return _call_mcp_json("exec_shell", command=command, timeout=30)
+
+    specs = [
+        ("list_namespaces", list_namespaces),
+        ("list_pods", list_pods),
+        ("describe_resource", describe_resource),
+        ("create_pod", create_pod),
+        ("delete_pod", delete_pod),
+        ("scale_deployment", scale_deployment),
+        ("restart_rollout", restart_rollout),
+        ("patch_resource", patch_resource),
     ]
-    config = {"configurable": {"thread_id": f"diag-{uuid4()}"}}
-    result = worker.invoke({"messages": [HumanMessage(content="\n".join(lines))]}, config=config)
-    logger.info("[DIAG-AGENT] diagnose_cluster() called")
-    return _attach_worker_signatures(_extract_answer(result))
+    return [wrap(fn, name=name, description=fn.__doc__ or "") for name, fn in specs]
 
 
+def _build_diagnostics_tools() -> Dict[str, Callable[..., Any]]:
+    return {
+        "get_logs": lambda namespace, service: mcp_call_tool("get_logs", {"namespace": namespace, "service": service}),
+        "get_metrics": lambda namespace, duration=5: mcp_call_tool("get_metrics", {"namespace": namespace, "duration": duration}),
+        "get_traces": lambda namespace, duration=5: mcp_call_tool("get_traces", {"namespace": namespace, "duration": duration}),
+        "read_metrics": lambda file_path: mcp_call_tool("read_metrics", {"file_path": file_path}),
+        "read_traces": lambda file_path: mcp_call_tool("read_traces", {"file_path": file_path}),
+        "pod_events": lambda namespace, pod: mcp_call_tool("pod_events", {"namespace": namespace, "pod": pod}),
+        "pod_logs": lambda namespace, pod, tail_lines=80: mcp_call_tool(
+            "pod_logs", {"namespace": namespace, "pod": pod, "tail_lines": tail_lines}
+        ),
+        "list_pods": lambda namespace="default": mcp_call_tool("list_pods", {"namespace": namespace}),
+        "exec_shell": lambda command, timeout=30: mcp_call_tool("exec_shell", {"command": command, "timeout": timeout}),
+    }
 
-def build_agent_v1(system_prompt: str) -> Any:
-    """Create the LangChain agent wired up with MCP-backed tools."""
-    tools = list(_build_tools())
-    llm = _build_llm()
-    logger.info("Supervisor LLM type: %r", llm)
+
+@dataclass
+class SupervisorWorkflow:
+    operations_agent: Any
+    diagnostics_tools: Dict[str, Callable[..., Any]]
+
+    def router_node(self, state: SupervisorState) -> SupervisorState:
+        return {"intent": classify_intent(state.get("user_request", ""))}
+
+    def operations_node(self, state: SupervisorState, config: Dict[str, Any] | None = None) -> SupervisorState:
+        request = state.get("user_request", "")
+        result = self.operations_agent.invoke({"messages": [HumanMessage(content=request)]}, config=config)
+        update: SupervisorState = {"operation_result": result}
+        if result.get("__interrupt__"):
+            update["__interrupt__"] = result["__interrupt__"]
+            update["final_response"] = "Approval required before executing operations action."
+            return update
+        update["final_response"] = _extract_answer(result)
+        return update
+
+    def detection_node(self, state: SupervisorState) -> SupervisorState:
+        text = state.get("user_request", "")
+        namespace_match = re.search(r"namespace\s+([a-z0-9-]+)", text.lower())
+        namespace = namespace_match.group(1) if namespace_match else "default"
+        pods = self.diagnostics_tools["list_pods"](namespace)
+        pod_items = pods.get("pods") if isinstance(pods, dict) else None
+        issue_found = False
+        unhealthy: List[str] = []
+        if isinstance(pod_items, list):
+            for pod in pod_items:
+                phase = str(pod.get("phase", "")).lower()
+                if phase not in {"running", "succeeded"}:
+                    unhealthy.append(pod.get("name", "unknown"))
+            issue_found = bool(unhealthy)
+        summary = {
+            "namespace": namespace,
+            "pods_checked": len(pod_items or []),
+            "unhealthy_pods": unhealthy,
+        }
+        return {
+            "issue_found": issue_found,
+            "location": namespace,
+            "diagnostics_summary": {"detection": summary},
+            "final_response": "No issue detected." if not issue_found else state.get("final_response", ""),
+        }
+
+    def localization_node(self, state: SupervisorState) -> SupervisorState:
+        if not state.get("issue_found"):
+            return {}
+        namespace = state.get("location", "default")
+        detection = (state.get("diagnostics_summary") or {}).get("detection", {})
+        suspect = (detection.get("unhealthy_pods") or ["unknown"])[0]
+        events = self.diagnostics_tools["pod_events"](namespace, suspect)
+        logs = self.diagnostics_tools["pod_logs"](namespace, suspect, 80)
+        summary = {"suspect_pod": suspect, "events": events, "logs": logs}
+        merged = dict(state.get("diagnostics_summary") or {})
+        merged["localization"] = summary
+        return {"diagnostics_summary": merged, "location": f"{namespace}/{suspect}"}
+
+    def analysis_node(self, state: SupervisorState) -> SupervisorState:
+        if not state.get("issue_found"):
+            return {}
+        namespace = state.get("location", "default").split("/")[0]
+        shell = self.diagnostics_tools["exec_shell"](f"kubectl get pods -n {namespace}")
+        merged = dict(state.get("diagnostics_summary") or {})
+        merged["analysis"] = {"kubectl_get_pods": shell}
+        analysis_text = f"Potential issue localized to {state.get('location')}."
+        return {"diagnostics_summary": merged, "analysis_result": analysis_text}
+
+    def mitigation_node(self, state: SupervisorState) -> SupervisorState:
+        if not state.get("issue_found"):
+            return {"mitigation_plan": {}, "final_response": "No issue detected during diagnostics."}
+        location = state.get("location", "default/unknown")
+        namespace, _, pod = location.partition("/")
+        plan = {
+            "summary": f"Investigate and recover pod {pod} in namespace {namespace}.",
+            "actions": [
+                f"describe_resource pod {pod} -n {namespace}",
+                f"delete_pod {namespace} {pod}",
+            ],
+        }
+        request_text = state.get("user_request", "").lower()
+        execute = any(token in request_text for token in ["execute", "apply", "run mitigation", "approve mitigation"])
+        response = (
+            f"Detection found issues. Localization: {location}. Analysis: {state.get('analysis_result', '')}\n"
+            f"Proposed mitigation: {plan['summary']}\nActions: {', '.join(plan['actions'])}"
+        )
+        return {"mitigation_plan": plan, "execute_mitigation": execute, "final_response": response}
+
+    def mitigation_to_operations_node(self, state: SupervisorState, config: Dict[str, Any] | None = None) -> SupervisorState:
+        plan = state.get("mitigation_plan") or {}
+        namespace = state.get("location", "default/unknown").split("/")[0]
+        pod = state.get("location", "default/unknown").split("/")[-1]
+        mitigation_request = (
+            f"Execute approved mitigation now. "
+            f"Use describe_resource for pod {pod} in namespace {namespace}, then delete_pod namespace={namespace} name={pod}."
+        )
+        op_state: SupervisorState = {"user_request": mitigation_request}
+        result = self.operations_node(op_state, config=config)
+        if result.get("__interrupt__"):
+            return result
+        final = f"{state.get('final_response', '')}\n\nMitigation execution result:\n{result.get('final_response', '')}"
+        return {"final_response": final, "operation_result": result.get("operation_result", {})}
+
+
+def _build_operations_agent() -> Any:
+    hitl_policy = {
+        "create_pod": True,
+        "delete_pod": True,
+        "scale_deployment": True,
+        "restart_rollout": True,
+        "patch_resource": True,
+        "list_namespaces": False,
+        "list_pods": False,
+        "describe_resource": False,
+    }
     return create_agent(
-        model=llm,
-        tools=tools,
-        system_prompt=system_prompt,
-        middleware=[
-            HumanInTheLoopMiddleware(
-                interrupt_on=HITL_POLICY,
-                description_prefix="Tool execution pending approval",
-            )
-        ],
+        model=_build_llm(),
+        tools=list(_build_operations_tools()),
+        system_prompt=(
+            "You are the Kubernetes operations agent. Handle inspect and act requests with provided tools. "
+            "For act requests perform only requested actions; for mitigation execution follow explicit instructions."
+        ),
+        middleware=[HumanInTheLoopMiddleware(interrupt_on=hitl_policy, description_prefix="Tool execution pending approval")],
         checkpointer=CHECKPOINTER,
     )
 
-def _attach_worker_signatures(answer: str) -> str:
-    """Append deterministic signatures so responses can be verified."""
-    payload = answer or ""
-    secret = os.getenv("WORKER_SIGNATURE_SECRET", _DEFAULT_SIGNATURE_SECRET).encode("utf-8")
-    body = payload.encode("utf-8")
-    hmac_sha256 = hmac.new(secret, body, hashlib.sha256).hexdigest()
-    blake2s_sig = hashlib.blake2s(body + secret).hexdigest()
-    signature_block = (
-        "\n\n---\n"
-        "Worker agent signatures:\n"
-        f"- hmac_sha256: {hmac_sha256}\n"
-        f"- blake2s: {blake2s_sig}\n"
+
+def build_agent_v1(system_prompt: str) -> Any:  # system_prompt kept for compatibility
+    workflow = SupervisorWorkflow(
+        operations_agent=_build_operations_agent(),
+        diagnostics_tools=_build_diagnostics_tools(),
     )
-    return payload.rstrip("\n") + signature_block
+
+    graph = StateGraph(SupervisorState)
+
+    def bootstrap_node(state: Dict[str, Any]) -> SupervisorState:
+        messages = state.get("messages") or []
+        user_request = ""
+        for message in reversed(messages):
+            if isinstance(message, HumanMessage):
+                user_request = message.content
+                break
+            if isinstance(message, dict) and message.get("role") == "user":
+                user_request = str(message.get("content", ""))
+                break
+        if not user_request and state.get("user_request"):
+            user_request = str(state["user_request"])
+        return {"user_request": user_request}
+
+    graph.add_node("bootstrap", bootstrap_node)
+    graph.add_node("router", workflow.router_node)
+    graph.add_node("operations", workflow.operations_node)
+    graph.add_node("detection", workflow.detection_node)
+    graph.add_node("localization", workflow.localization_node)
+    graph.add_node("analysis", workflow.analysis_node)
+    graph.add_node("mitigation", workflow.mitigation_node)
+    graph.add_node("mitigation_execute", workflow.mitigation_to_operations_node)
+
+    graph.add_edge(START, "bootstrap")
+    graph.add_edge("bootstrap", "router")
+
+    def route_from_router(state: SupervisorState) -> str:
+        return "detection" if state.get("intent") == "diagnose" else "operations"
+
+    graph.add_conditional_edges("router", route_from_router, {"operations": "operations", "detection": "detection"})
+
+    def detection_gate(state: SupervisorState) -> str:
+        return "end" if not state.get("issue_found") else "localization"
+
+    graph.add_conditional_edges("detection", detection_gate, {"end": END, "localization": "localization"})
+    graph.add_edge("localization", "analysis")
+    graph.add_edge("analysis", "mitigation")
+
+    def mitigation_gate(state: SupervisorState) -> str:
+        return "mitigation_execute" if state.get("execute_mitigation") else "end"
+
+    graph.add_conditional_edges("mitigation", mitigation_gate, {"mitigation_execute": "mitigation_execute", "end": END})
+    graph.add_edge("mitigation_execute", END)
+    graph.add_edge("operations", END)
+
+    return graph.compile(checkpointer=CHECKPOINTER)

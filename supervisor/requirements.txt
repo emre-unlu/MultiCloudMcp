@@ -6,4 +6,4 @@ requests
 langchain
 langchain-core
 langchain-community
-langchain-ollama
+langchain-openai
