@@ -2,8 +2,8 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 
-MODEL = os.getenv("MODEL", "ollama:gpt-oss:20b-cloud")
-DIAGNOSTICS_MODEL=os.getenv("DIAGNOSTICS_MODEL", "ollama:gpt-oss:20b-cloud") 
+MODEL = os.getenv("MODEL", "gpt-5-mini-2025-08-07")
+DIAGNOSTICS_MODEL=os.getenv("DIAGNOSTICS_MODEL", "gpt-5-mini-2025-08-07") 
 
 
 MCP_SERVERS = {

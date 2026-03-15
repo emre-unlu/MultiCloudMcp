@@ -21,9 +21,11 @@ except ImportError:  # pragma: no cover
     StructuredTool = None
 
 try:
-    from langchain_ollama import ChatOllama
+    from langchain_openai import ChatOpenAI
 except ImportError:  # pragma: no cover
-    ChatOllama = None
+    ChatOpenAI = None
+
+logger = logging.getLogger(__name__)
 
 logger = logging.getLogger(__name__)
 
@@ -129,13 +131,13 @@ def _extract_answer(payload: Dict[str, Any]) -> str:
 
 
 def _build_llm(model_spec: Optional[str] = None) -> Any:
-    spec = model_spec or os.getenv("MODEL", "ollama:gpt-oss:20b-cloud")
-    if spec.startswith("ollama:"):
-        if ChatOllama is None:
-            raise RuntimeError("Install langchain-ollama to use ollama models.")
-        _, _, model_name = spec.partition(":")
-        return ChatOllama(model=model_name or "gpt-oss:20b-cloud", base_url=os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434"))
-    return spec
+    model_name = model_spec or os.getenv("MODEL", "gpt-5-mini-2025-08-07")
+    if ChatOpenAI is None:
+        raise RuntimeError("Install langchain-openai to use OpenAI models.")
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set. Please export it before starting the supervisor.")
+    return ChatOpenAI(model=model_name, api_key=api_key)
 
 
 def classify_intent(user_request: str) -> Literal["inspect", "act", "diagnose"]:
