@@ -184,7 +184,7 @@ def run(req: RunReq):
         )
         PENDING_INTERRUPTS.pop(thread_id, None)
     else:
-        result = agent.invoke({"messages": [HumanMessage(content=content)]}, config=config)
+        result = agent.invoke({"messages": [HumanMessage(content=content)], "user_request": content}, config=config)
 
     answer = _normalize_answer_content(result.get("final_response"))
     if not answer:
