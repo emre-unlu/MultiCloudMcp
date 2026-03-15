@@ -27,6 +27,8 @@ except ImportError:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
+logger = logging.getLogger(__name__)
+
 K8S_MCP_URL = os.getenv("K8S_MCP_URL", "http://127.0.0.1:8080")
 HDRS = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
 _SESSION = requests.Session()
