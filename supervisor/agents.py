@@ -11,6 +11,7 @@ import requests
 from langchain.agents import create_agent
 from langchain.agents.middleware import HumanInTheLoopMiddleware
 from langchain.messages import AIMessage, HumanMessage
+from langchain_core.runnables import RunnableConfig
 from langchain.tools import BaseTool, tool
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
@@ -232,7 +233,7 @@ class SupervisorWorkflow:
     def router_node(self, state: SupervisorState) -> SupervisorState:
         return {"intent": classify_intent(state.get("user_request", ""))}
 
-    def operations_node(self, state: SupervisorState, config: Dict[str, Any] | None = None) -> SupervisorState:
+    def operations_node(self, state: SupervisorState, config: RunnableConfig | None = None) -> SupervisorState:
         request = state.get("user_request", "")
         result = self.operations_agent.invoke({"messages": [HumanMessage(content=request)]}, config=config)
         update: SupervisorState = {"operation_result": result}
@@ -311,7 +312,7 @@ class SupervisorWorkflow:
         )
         return {"mitigation_plan": plan, "execute_mitigation": execute, "final_response": response}
 
-    def mitigation_to_operations_node(self, state: SupervisorState, config: Dict[str, Any] | None = None) -> SupervisorState:
+    def mitigation_to_operations_node(self, state: SupervisorState, config: RunnableConfig | None = None) -> SupervisorState:
         plan = state.get("mitigation_plan") or {}
         namespace = state.get("location", "default/unknown").split("/")[0]
         pod = state.get("location", "default/unknown").split("/")[-1]
