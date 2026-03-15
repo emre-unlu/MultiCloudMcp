@@ -81,6 +81,31 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(self.trace, ["detection", "localization", "analysis"])
         self.assertIn("Proposed mitigation", state["final_response"])
 
+    def test_detection_handles_list_pods_tool_shape_and_restarts(self):
+        def list_pods_as_list(namespace="default"):
+            self.trace.append("detection")
+            return [
+                {
+                    "name": "api-0",
+                    "phase": "Running",
+                    "restarts": 2,
+                    "containers": [{"state": {"state": "running"}}],
+                }
+            ]
+
+        workflow = SupervisorWorkflow(
+            operations_agent=self.ops,
+            diagnostics_tools={
+                "list_pods": list_pods_as_list,
+                "pod_events": lambda namespace, pod: {},
+                "pod_logs": lambda namespace, pod, tail_lines=80: {},
+                "exec_shell": lambda command, timeout=30: {},
+            },
+        )
+        result = workflow.detection_node({"user_request": "diagnose namespace default"})
+        self.assertTrue(result["issue_found"])
+        self.assertEqual(result["diagnostics_summary"]["detection"]["unhealthy_pods"], ["api-0"])
+
     def test_mitigation_execution_goes_through_operations_agent(self):
         state = {
             "user_request": "diagnose and execute mitigation",
