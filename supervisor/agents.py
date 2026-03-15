@@ -3,7 +3,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, TypedDict
+from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Tuple, TypedDict
 
 import requests
 from langchain.agents import create_agent
@@ -128,6 +128,28 @@ def _extract_answer(payload: Dict[str, Any]) -> str:
     return ""
 
 
+
+
+def _normalize_pod_items(payload: Any) -> List[Dict[str, Any]]:
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except json.JSONDecodeError:
+            return []
+
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        for key in ("pods", "items"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def _diagnostics_tokens() -> Tuple[str, ...]:
+    return ("crashloop", "backoff", "error", "imagepull", "oomkilled", "failed")
+
 def _build_llm(model_spec: Optional[str] = None) -> Any:
     model_name = model_spec or os.getenv("MODEL", "gpt-5-mini-2025-08-07")
     if ChatOpenAI is None:
@@ -218,6 +240,7 @@ def _build_diagnostics_tools() -> Dict[str, Callable[..., Any]]:
         "pod_logs": lambda namespace, pod, tail_lines=80: mcp_call_tool(
             "pod_logs", {"namespace": namespace, "pod": pod, "tail_lines": tail_lines}
         ),
+        "list_namespaces": lambda: mcp_call_tool("list_namespaces", {}),
         "list_pods": lambda namespace="default": mcp_call_tool("list_pods", {"namespace": namespace}),
         "exec_shell": lambda command, timeout=30: mcp_call_tool("exec_shell", {"command": command, "timeout": timeout}),
     }
@@ -244,35 +267,96 @@ class SupervisorWorkflow:
     def detection_node(self, state: SupervisorState) -> SupervisorState:
         text = state.get("user_request", "")
         namespace_match = re.search(r"namespace\s+([a-z0-9-]+)", text.lower())
-        namespace = namespace_match.group(1) if namespace_match else "default"
-        pods = self.diagnostics_tools["list_pods"](namespace)
-        pod_items = pods.get("pods") if isinstance(pods, dict) else None
-        issue_found = False
+        requested_namespace = namespace_match.group(1) if namespace_match else None
+
+        namespaces = [requested_namespace] if requested_namespace else ["default"]
+        if not requested_namespace and "list_namespaces" in self.diagnostics_tools:
+            namespace_payload = self.diagnostics_tools["list_namespaces"]()
+            if isinstance(namespace_payload, str):
+                try:
+                    namespace_payload = json.loads(namespace_payload)
+                except json.JSONDecodeError:
+                    namespace_payload = None
+            if isinstance(namespace_payload, list):
+                discovered = [str(item) for item in namespace_payload if item]
+                if discovered:
+                    namespaces = discovered
+
         unhealthy: List[str] = []
-        if isinstance(pod_items, list):
+        pods_checked = 0
+        namespace_errors: Dict[str, str] = {}
+        tokens = _diagnostics_tokens()
+
+        for namespace in namespaces:
+            try:
+                pods_payload = self.diagnostics_tools["list_pods"](namespace)
+            except Exception as exc:  # pragma: no cover - MCP transport/runtime failure
+                namespace_errors[namespace] = str(exc)
+                continue
+
+            pod_items = _normalize_pod_items(pods_payload)
+            pods_checked += len(pod_items)
             for pod in pod_items:
+                pod_name = str(pod.get("name", "unknown"))
                 phase = str(pod.get("phase", "")).lower()
-                if phase not in {"running", "succeeded"}:
-                    unhealthy.append(pod.get("name", "unknown"))
-            issue_found = bool(unhealthy)
+                reason = str(pod.get("reason", "")).lower()
+                restarts = int(pod.get("restarts") or 0)
+                containers = pod.get("containers") if isinstance(pod.get("containers"), list) else []
+
+                container_unhealthy = any(
+                    (
+                        str(container.get("state", {}).get("state", "")).lower() in {"waiting", "terminated"}
+                        or any(
+                            token in str(container.get("state", {}).get(field, "")).lower()
+                            for field in ("reason", "message")
+                            for token in tokens
+                        )
+                    )
+                    for container in containers
+                    if isinstance(container, dict)
+                )
+
+                pod_unhealthy = (
+                    phase not in {"running", "succeeded"}
+                    or any(token in reason for token in tokens)
+                    or container_unhealthy
+                    or restarts > 0
+                )
+                if pod_unhealthy:
+                    unhealthy.append(f"{namespace}/{pod_name}")
+
+        issue_found = bool(unhealthy)
         summary = {
-            "namespace": namespace,
-            "pods_checked": len(pod_items or []),
+            "namespace": requested_namespace or "all",
+            "pods_checked": pods_checked,
             "unhealthy_pods": unhealthy,
+            "namespace_errors": namespace_errors,
         }
+
+        if issue_found:
+            response = state.get("final_response", "")
+        elif pods_checked == 0 and namespace_errors:
+            response = "Diagnostics could not retrieve pods. Check Kubernetes/MCP connectivity and namespace access."
+        elif pods_checked == 0:
+            response = "Diagnostics found no pods to evaluate."
+        else:
+            response = "No issue detected."
+
         return {
             "issue_found": issue_found,
-            "location": namespace,
+            "location": requested_namespace or "default",
             "diagnostics_summary": {"detection": summary},
-            "final_response": "No issue detected." if not issue_found else state.get("final_response", ""),
+            "final_response": response,
         }
 
     def localization_node(self, state: SupervisorState) -> SupervisorState:
         if not state.get("issue_found"):
             return {}
-        namespace = state.get("location", "default")
         detection = (state.get("diagnostics_summary") or {}).get("detection", {})
-        suspect = (detection.get("unhealthy_pods") or ["unknown"])[0]
+        suspect_ref = str((detection.get("unhealthy_pods") or ["default/unknown"])[0])
+        namespace, _, suspect = suspect_ref.partition("/")
+        namespace = namespace or state.get("location", "default")
+        suspect = suspect or "unknown"
         events = self.diagnostics_tools["pod_events"](namespace, suspect)
         logs = self.diagnostics_tools["pod_logs"](namespace, suspect, 80)
         summary = {"suspect_pod": suspect, "events": events, "logs": logs}
